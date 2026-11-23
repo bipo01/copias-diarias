@@ -1,0 +1,92 @@
+# Cópia DIÁRIA do banco. Repositório público de propósito (minutos sem custo e sem cota):
+# nada sensível aparece no registro, e o arquivo guardado sai trancado com age.
+#   segredo  BACKUP_DATABASE_URL   → conexão de um usuário SÓ DE LEITURA (sslmode=require)
+#   variável BACKUP_AGE_RECIPIENT  → chave PÚBLICA do age ("age1…"); a privada nunca vem para cá
+name: copia
+on:
+  schedule:
+    - cron: "0 6 * * *" # todo dia, 03:00 em Brasília
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: copia
+  cancel-in-progress: false
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BACKUP_DATABASE_URL: ${{ secrets.BACKUP_DATABASE_URL }}
+      AGE_RECIPIENT: ${{ vars.BACKUP_AGE_RECIPIENT }}
+      PG: "18" # o pg_dump precisa ser da versão do servidor ou mais nova
+    steps:
+      - name: Conferir a configuração
+        run: |
+          if [ -z "$BACKUP_DATABASE_URL" ] || [ -z "$AGE_RECIPIENT" ]; then
+            echo "::error::Falta o segredo BACKUP_DATABASE_URL ou a variável BACKUP_AGE_RECIPIENT."
+            exit 1
+          fi
+
+      - name: Instalar pg_dump e age
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "postgresql-client-$PG" age > /dev/null
+
+      - name: Copiar, conferir e trancar
+        run: |
+          set -euo pipefail
+          umask 077
+          BIN="/usr/lib/postgresql/$PG/bin"
+          DIA="$(TZ=America/Sao_Paulo date +%Y-%m-%d)"
+          # o registro é público: o endereço do servidor não aparece nem em mensagem de erro
+          "$BIN/pg_dump" --format=custom --no-owner --no-privileges --dbname="$BACKUP_DATABASE_URL" --file=dump.pgc \
+            2> >(sed -E 's#[a-z0-9.-]+\.neon\.tech#<servidor>#g; s#postgres(ql)?://[^ ]+#<conexão>#g' >&2)
+          LISTA="$("$BIN/pg_restore" --list dump.pgc)"
+          # Uma cópia sem as tabelas do negócio não serve: falha aqui, não no dia de restaurar.
+          echo "Tabelas com dados na cópia: $(grep -c 'TABLE DATA public gst_' <<< "$LISTA")"
+          grep -q 'TABLE DATA public gst_lancamentos' <<< "$LISTA"
+          grep -q 'TABLE DATA public gst_eventos' <<< "$LISTA"
+          age --recipient "$AGE_RECIPIENT" --output "copia-$DIA.pgc.age" dump.pgc
+          rm -f dump.pgc
+          sha256sum "copia-$DIA.pgc.age" | tee "copia-$DIA.pgc.age.sha256"
+          echo "Tamanho trancado: $(du -h "copia-$DIA.pgc.age" | cut -f1)"
+
+      - name: Guardar (90 dias)
+        uses: actions/upload-artifact@v4
+        with:
+          name: copia-${{ github.run_id }}
+          path: |
+            copia-*.pgc.age
+            copia-*.pgc.age.sha256
+          retention-days: 90
+          if-no-files-found: error
+
+  vivo:
+    # Repositório público sem atividade por 60 dias tem os fluxos agendados desligados pelo GitHub.
+    # Uma vez por mês (dia 1º) este passo grava a data em vivo.txt.
+    needs: dump
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 6 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Marcar o mês
+        run: |
+          set -euo pipefail
+          MES="$(TZ=America/Sao_Paulo date +%Y-%m)"
+          if [ "$(cat vivo.txt 2>/dev/null)" = "$MES" ]; then echo "Já marcado em $MES."; exit 0; fi
+          echo "$MES" > vivo.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add vivo.txt
+          git commit -m "vivo: $MES"
+          git push
